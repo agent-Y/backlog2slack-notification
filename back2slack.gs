@@ -2,22 +2,118 @@
  * Backlogの通知を取得してSlackへ流すGoogle Apps Script（シンプル版）
  *
  * ▼準備
- * 1) スクリプト プロパティに以下を保存（エディタ左の設定→スクリプト プロパティ）
- *    - BACKLOG_SPACE: 例 "yourspace"（https://yourspace.backlog.com のサブドメイン）
- *    - BACKLOG_API_KEY: BacklogのAPIキー（絶対にコード直書きしない）
- *    - SLACK_WEBHOOK_URL: SlackのIncoming Webhook URL
+ * 1) スクリプト プロパティを設定（エディタ左の設定→スクリプト プロパティ）
+ *    - 複数ワークスペース対応: BACKLOG_CONFIGS にJSON配列を保存
+ *      例: [{ "space": "space1", "apiKey": "xxx", "webhook": "https://hooks.slack.com/..." }, ...]
+ *      任意で label, storageKey を指定可能
+ *    - 旧シングル設定を使う場合（後方互換）:
+ *      BACKLOG_SPACE, BACKLOG_API_KEY, SLACK_WEBHOOK_URL を従来どおり設定
  * 2) トリガー: 実行関数 run を「時間主導型」で 5〜15分毎に設定
  */
 
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 const LAST_SEEN_ID_KEY = 'BACKLOG_LAST_SEEN_NOTIFICATION_ID';
+const CONFIGS_PROP_KEY = 'BACKLOG_CONFIGS';
 
 function run() {
-  const space = mustGetProp('BACKLOG_SPACE');
-  const apiKey = mustGetProp('BACKLOG_API_KEY');
-  const webhook = mustGetProp('SLACK_WEBHOOK_URL');
+  const configs = loadWorkspaceConfigs();
+  configs.forEach(processWorkspace);
+}
 
-  const lastSeenId = Number(SCRIPT_PROPS.getProperty(LAST_SEEN_ID_KEY) || 0);
+/** 必須プロパティの取得（なければエラー） */
+function mustGetProp(key) {
+  const v = SCRIPT_PROPS.getProperty(key);
+  if (!v) throw new Error(`スクリプトプロパティ ${key} が設定されていません`);
+  return v;
+}
+
+function loadWorkspaceConfigs() {
+  const raw = SCRIPT_PROPS.getProperty(CONFIGS_PROP_KEY);
+  if (raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`スクリプトプロパティ ${CONFIGS_PROP_KEY} が不正なJSONです: ${err.message}`);
+    }
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      throw new Error(`スクリプトプロパティ ${CONFIGS_PROP_KEY} は1件以上の設定を含む配列である必要があります`);
+    }
+    const configs = parsed.map((cfg, idx) => normalizeConfig(cfg, idx, true));
+    ensureUniqueStorageKeys(configs);
+    return configs;
+  }
+
+  return [normalizeConfig({
+    space: mustGetProp('BACKLOG_SPACE'),
+    apiKey: mustGetProp('BACKLOG_API_KEY'),
+    webhook: mustGetProp('SLACK_WEBHOOK_URL'),
+    legacy: true,
+  }, 0, false)];
+}
+
+function normalizeConfig(rawConfig, index, multiMode) {
+  if (!rawConfig || typeof rawConfig !== 'object') {
+    throw new Error(`${CONFIGS_PROP_KEY} の要素${index + 1}がオブジェクトではありません`);
+  }
+
+  const space = pickString(rawConfig.space);
+  const apiKey = pickString(rawConfig.apiKey || rawConfig.api_key);
+  const webhook = pickString(rawConfig.webhook || rawConfig.slackWebhook || rawConfig.slack_webhook);
+
+  if (!space) throw new Error(`${CONFIGS_PROP_KEY} の要素${index + 1}に space がありません`);
+  if (!apiKey) throw new Error(`${CONFIGS_PROP_KEY} の要素${index + 1}に apiKey がありません`);
+  if (!webhook) throw new Error(`${CONFIGS_PROP_KEY} の要素${index + 1}に webhook がありません`);
+
+  const identifierSource = pickString(rawConfig.id || rawConfig.identifier || rawConfig.label || rawConfig.name || rawConfig.space);
+  const displayLabel = identifierSource || `workspace-${index + 1}`;
+  const customStorageKey = pickString(rawConfig.storageKey);
+  const storageCandidate = customStorageKey && customStorageKey.startsWith(LAST_SEEN_ID_KEY)
+    ? customStorageKey
+    : `${LAST_SEEN_ID_KEY}__${slugForProperty(customStorageKey || identifierSource || `workspace-${index + 1}`)}`;
+  const storageBase = rawConfig.legacy ? LAST_SEEN_ID_KEY : storageCandidate;
+  const storageKey = multiMode ? storageBase : (rawConfig.legacy ? LAST_SEEN_ID_KEY : storageBase);
+
+  return {
+    space,
+    apiKey,
+    webhook,
+    label: displayLabel,
+    storageKey,
+  };
+}
+
+function slugForProperty(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'workspace';
+}
+
+function ensureUniqueStorageKeys(configs) {
+  const used = {};
+  configs.forEach((cfg, idx) => {
+    let baseKey = cfg.storageKey && cfg.storageKey.trim();
+    if (!baseKey) {
+      baseKey = `${LAST_SEEN_ID_KEY}__workspace_${idx + 1}`;
+    }
+    let candidate = baseKey;
+    let suffix = 2;
+    while (used[candidate]) {
+      candidate = `${baseKey}_${suffix++}`;
+    }
+    cfg.storageKey = candidate;
+    used[candidate] = true;
+  });
+}
+
+function pickString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function processWorkspace(config) {
+  const { space, apiKey, webhook, storageKey, label } = config;
+  const lastSeenId = Number(SCRIPT_PROPS.getProperty(storageKey) || 0);
   const { newNotifications, maxId } = fetchNewNotifications({ space, apiKey, lastSeenId });
 
   if (newNotifications.length > 0) {
@@ -26,20 +122,14 @@ function run() {
       const payload = buildSlackPayload(n, space);
       postToSlack(webhook, payload);
     });
+    Logger.log(`[${label}] ${newNotifications.length}件の通知をSlackへ送信`);
   } else {
-    Logger.log('新着通知なし（送信なし）');
+    Logger.log(`[${label}] 新着通知なし（送信なし）`);
   }
 
   if (maxId > lastSeenId) {
-    SCRIPT_PROPS.setProperty(LAST_SEEN_ID_KEY, String(maxId));
+    SCRIPT_PROPS.setProperty(storageKey, String(maxId));
   }
-}
-
-/** 必須プロパティの取得（なければエラー） */
-function mustGetProp(key) {
-  const v = SCRIPT_PROPS.getProperty(key);
-  if (!v) throw new Error(`スクリプトプロパティ ${key} が設定されていません`);
-  return v;
 }
 
 /** Backlog API呼び出し */
